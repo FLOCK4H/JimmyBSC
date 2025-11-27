@@ -1,0 +1,18 @@
+{
+    // RA still ignores target, burt VS Code’s watcher won’t churn
+    "files.watcherExclude": {
+      "**/target/**": true,
+      "**/node_modules/**": true,
+      "**/.git/**": true,
+      "**/dist/**": true,
+      "**/build/**": true,
+      "**/.next/**": true
+    },
+    "search.exclude": {
+      "**/target": true,
+      "**/node_modules": true,
+      "**/dist": true,
+      "**/build": true,
+      "**/.next": true
+    },
+  }

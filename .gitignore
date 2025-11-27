@@ -1,0 +1,11 @@
+target
+/.cache
+
+/logs/
+
+/logs/*
+
+/x_search/
+/x_search/*
+
+old.cache/
