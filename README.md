@@ -2,6 +2,8 @@
 
 JimmyB is a TUI app for watching new BSC pairs and auto–trading them using simple rules.
 
+**Tested for both Linux and Windows platforms.**
+
 It connects to:
 - PancakeSwap V2 / V3; and
 - FourMeme’s `TokenManagerHelper3`
