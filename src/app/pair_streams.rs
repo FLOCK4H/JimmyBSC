@@ -1,10 +1,30 @@
-use {
-    crate::app::auto_trade::pair_key_addr,
-    crate::app::pair_state::{detect_source, extract_price_f64, PairState},
-    crate::libs::ws::pairs::PairInfo,
-    std::collections::{HashMap, HashSet, VecDeque},
-    std::time::Instant,
-};
+    use {
+        crate::app::auto_trade::pair_key_addr,
+        crate::app::pair_state::{detect_source, extract_price_f64, PairState},
+        crate::libs::ws::pairs::PairInfo,
+        once_cell::sync::Lazy,
+        std::collections::{HashMap, HashSet, VecDeque},
+        std::sync::RwLock,
+        std::time::Instant,
+    };
+
+static PAIR_METRICS: Lazy<RwLock<HashMap<String, (f64, Instant)>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+pub fn pair_metrics(pair_key: &str) -> Option<(f64, Instant)> {
+    PAIR_METRICS
+        .read()
+        .ok()
+        .and_then(|m| m.get(pair_key).cloned())
+}
+
+fn update_metrics(pair_key: &str, pnl_pct: Option<f64>, first_seen: Instant) {
+    if let Some(pnl) = pnl_pct {
+        if let Ok(mut m) = PAIR_METRICS.write() {
+            m.insert(pair_key.to_string(), (pnl, first_seen));
+        }
+    }
+}
 
 /// Fast, synchronous updater for Hermes pair state.
 /// - Only updates `pairs_map`/`pair_keys`/`sold_pairs`
@@ -15,7 +35,7 @@ pub fn update_pairs_state(
     pair_info: PairInfo,
     pairs_map: &mut HashMap<String, PairState>,
     pair_keys: &mut VecDeque<String>,
-    sold_pairs: &mut HashSet<String>,
+    _sold_pairs: &mut HashSet<String>,
     max_pairs: usize,
 ) {
     if l1.contains("Price: ?") {
@@ -68,11 +88,16 @@ pub fn update_pairs_state(
                 if new_pnl != 0 {
                     entry.last_nonzero_seen = nowi;
                 }
+                update_metrics(
+                    &pair_key_addr(pair_info.pair),
+                    Some(new_pnl as f64 / 100.0),
+                    entry.last_nonzero_seen,
+                );
             }
         }
     } else {
         // Freeze intake if MAX_PAIRS reached; only update existing entries above
-        if pair_keys.len() >= max_pairs || sold_pairs.contains(&pair_key_addr(pair_info.pair)) {
+        if pair_keys.len() >= max_pairs {
             return;
         }
         let nowi = Instant::now();
@@ -103,6 +128,11 @@ pub fn update_pairs_state(
                 if pct <= -0.1 {
                     st.below_thresh_since = Some(nowi);
                 }
+                update_metrics(
+                    &pair_key_addr(pair_info.pair),
+                    Some(new_pnl as f64 / 100.0),
+                    nowi,
+                );
             }
         }
         pairs_map.insert(pair_key_addr(pair_info.pair), st);

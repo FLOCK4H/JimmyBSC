@@ -744,8 +744,8 @@ pub async fn fourmeme_stream(
                         let liq_s = liq_usd.unwrap_or_else(|| "…".to_string());
 
                         let link = format!(
-                            "{} https://four.meme/token/{:#x}",
-                            Local::now().format("%H:%M"),
+                            "Created at: {} https://four.meme/token/{:#x}",
+                            Local::now().format("%H:%M:%S"),
                             base
                         );
                         let line1 = format!(

@@ -2,6 +2,7 @@ use {
     crate::app::pair_state::detect_source,
     crate::app::pair_state::extract_price_f64,
     crate::app::pair_state::PairSource,
+    crate::app::pair_streams::pair_metrics,
     crate::libs::lookup::save_log_to_file,
     crate::libs::sim::{DexType, SimEngine},
     crate::libs::tui::ConfigStore,
@@ -25,6 +26,7 @@ use crate::routy::{v2 as routy_v2, v3 as routy_v3, wbnb};
 use alloy::primitives::utils::parse_units;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, WalletProvider};
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use pancakes::pancake::pancake_swap::addresses::WBNB;
 use pancakes::pancake::pancake_swap::PancakeV3;
@@ -84,6 +86,38 @@ fn wrap_ratio_pct_value(config_store: &ConfigStore) -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| v.clamp(1, 99))
         .unwrap_or(80)
+}
+
+fn record_buy_failure(trader: &mut RealTrader, pair_key: &str) -> u32 {
+    let cnt = BUY_FAILS
+        .entry(pair_key.to_string())
+        .and_modify(|v| *v += 1)
+        .or_insert(1);
+    if *cnt >= 3 {
+        trader.block_rebuy(pair_key);
+        save_log_to_file(&format!(
+            "[trade] SKIP {}: marked do-not-rebuy after {} failed attempts",
+            pair_key,
+            *cnt
+        ));
+    }
+    *cnt
+}
+
+fn clear_buy_failures(pair_key: &str) {
+    BUY_FAILS.remove(pair_key);
+}
+
+fn contains_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        let u = c as u32;
+        (0x4E00..=0x9FFF).contains(&u)
+            || (0x3400..=0x4DBF).contains(&u)
+            || (0x20000..=0x2A6DF).contains(&u)
+            || (0x2A700..=0x2B73F).contains(&u)
+            || (0x2B740..=0x2B81F).contains(&u)
+            || (0x2B820..=0x2CEAF).contains(&u)
+    })
 }
 
 async fn wait_for_balance_drop<P>(
@@ -165,6 +199,7 @@ impl AllowanceWorker {
 }
 
 static ALLOWANCE_WORKER: Lazy<AllowanceWorker> = Lazy::new(AllowanceWorker::new);
+static BUY_FAILS: Lazy<DashMap<String, u32>> = Lazy::new(DashMap::new);
 
 fn dex_to_market(dex: DexType) -> Option<AllowanceMarket> {
     match dex {
@@ -315,7 +350,7 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("allowance failed")))
 }
 
-async fn ensure_sell_allowance<P>(
+pub(crate) async fn ensure_sell_allowance<P>(
     provider: P,
     dex: DexType,
     token: Address,
@@ -509,6 +544,14 @@ impl RealTrader {
         } else {
             false
         }
+    }
+
+    fn clear_all_closing(&mut self) {
+        self.closing.clear();
+    }
+
+    fn block_rebuy(&mut self, pair_key: &str) {
+        self.do_not_rebuy.insert(pair_key.to_string());
     }
 
     fn sell_decision(
@@ -751,14 +794,21 @@ where
                 gas_price_wei,
             )
             .await?;
-            let (_est, tx) = router
-                .sell_percent_pct(
-                    from,
-                    plan.token_out,
-                    plan.percent_points.max(1),
-                    Some(gas_price_wei_override),
-                )
-                .await?;
+            let sell_call = router.sell_percent_pct(
+                from,
+                plan.token_out,
+                plan.percent_points.max(1),
+                Some(gas_price_wei_override),
+            );
+            let sell_res =
+                tokio::time::timeout(Duration::from_secs(20), sell_call).await.map_err(|_| {
+                    anyhow!(
+                        "sell timeout for token {:#x} pct {}",
+                        plan.token_out,
+                        plan.percent_points
+                    )
+                })??;
+            let (_est, tx) = sell_res;
             let bal_after = safe_balance_of(provider.clone(), plan.token_out, from).await;
             let final_after = if bal_after < bal_before {
                 Some(bal_after)
@@ -913,7 +963,8 @@ where
     P: Provider + Clone + WalletProvider + Send + Sync + 'static,
 {
     let keys: Vec<String> = {
-        let trader = REAL_TRADER.lock().await;
+        let mut trader = REAL_TRADER.lock().await;
+        trader.clear_all_closing();
         trader.positions.keys().cloned().collect()
     };
     for k in keys {
@@ -992,6 +1043,25 @@ pub async fn auto_trade(
                     .unwrap_or(false);
 
                 if enabled && current_price > 0.0 {
+                    let avoid_cn = config_store
+                        .get("avoid_chinese")
+                        .map(|v| v.as_str() == "true")
+                        .unwrap_or(false);
+                    if avoid_cn
+                        && (contains_cjk(&pair_info.symbol_base)
+                            || contains_cjk(&pair_info.symbol_quote))
+                    {
+                        return Ok(());
+                    }
+                    let freshness_secs = config_store
+                        .get("freshness_secs")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(30);
+                    let min_pnl_pct = config_store
+                        .get("min_pnl_pct")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(100.0);
+
                     // 1. Check if quote token is accepted
                     let accepted_quotes_str = config_store
                         .get("accepted_quotes")
@@ -1008,22 +1078,24 @@ pub async fn auto_trade(
                     }
 
                     // liquidity check
-                    let min_liquidity = config_store
-                        .get("min_liquidity")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(1000.0);
-                    let liq_threshold = min_liquidity.max(5.0);
+                    if src != PairSource::FourMeme {
+                        let min_liquidity = config_store
+                            .get("min_liquidity")
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(1000.0);
+                        let liq_threshold = min_liquidity.max(5.0);
 
-                    if let Some(liq) = pair_info.liquidity_usd {
-                        if liq < liq_threshold {
-                            save_log_to_file(&format!(
-                                "[sim] REJECTED {}: Liq ${:.0} < min ${:.0}",
-                                pair_info.symbol_base, liq, liq_threshold
-                            ));
-                            return Ok(());
+                        if let Some(liq) = pair_info.liquidity_usd {
+                            if liq < liq_threshold {
+                                save_log_to_file(&format!(
+                                    "[sim] REJECTED {}: Liq ${:.0} < min ${:.0}",
+                                    pair_info.symbol_base, liq, liq_threshold
+                                ));
+                                return Ok(());
+                            }
+                        } else {
+                            return Ok(()); // No liquidity data
                         }
-                    } else {
-                        return Ok(()); // No liquidity data
                     }
 
                     // minimum buys check
@@ -1093,6 +1165,15 @@ pub async fn auto_trade(
                             PairSource::FourMeme => DexType::FourMeme,
                             _ => DexType::V2,
                         };
+
+                        if let Some((pnl_pct, first_seen)) =
+                            pair_metrics(&pair_addr_str.as_str())
+                        {
+                            if pnl_pct < min_pnl_pct && first_seen.elapsed().as_secs() > freshness_secs
+                            {
+                                return Ok(());
+                            }
+                        }
 
                         let submitted = sim_engine.submit_buy(
                             pair_addr_str.clone(),
@@ -1197,6 +1278,25 @@ where
             return Ok(());
         }
 
+        let avoid_cn = config_store
+            .get("avoid_chinese")
+            .map(|v| v.as_str() == "true")
+            .unwrap_or(false);
+        if avoid_cn
+            && (contains_cjk(&pair_info.symbol_base) || contains_cjk(&pair_info.symbol_quote))
+        {
+            return Ok(());
+        }
+
+        let freshness_secs = config_store
+            .get("freshness_secs")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let min_pnl_pct = config_store
+            .get("min_pnl_pct")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(100.0);
+
         {
             let trader = REAL_TRADER.lock().await;
             if trader.has_position_or_blocked(&pair_key) {
@@ -1229,21 +1329,29 @@ where
             return Ok(());
         }
 
-        let min_liquidity = config_store
-            .get("min_liquidity")
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1000.0);
-        let liq_threshold = min_liquidity.max(5.0);
-        if let Some(liq) = pair_info.liquidity_usd {
-            if liq < liq_threshold {
-                save_log_to_file(&format!(
-                    "[trade] REJECTED {}: Liq ${:.0} < min ${:.0}",
-                    pair_info.symbol_base, liq, liq_threshold
-                ));
+        if src != PairSource::FourMeme {
+            let min_liquidity = config_store
+                .get("min_liquidity")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1000.0);
+            let liq_threshold = min_liquidity.max(5.0);
+            if let Some(liq) = pair_info.liquidity_usd {
+                if liq < liq_threshold {
+                    save_log_to_file(&format!(
+                        "[trade] REJECTED {}: Liq ${:.0} < min ${:.0}",
+                        pair_info.symbol_base, liq, liq_threshold
+                    ));
+                    return Ok(());
+                }
+            } else {
                 return Ok(());
             }
-        } else {
-            return Ok(());
+        }
+
+        if let Some((pnl_pct, first_seen)) = pair_metrics(&pair_key.as_str()) {
+            if pnl_pct < min_pnl_pct && first_seen.elapsed().as_secs() > freshness_secs {
+                return Ok(());
+            }
         }
 
         // minimum buys in recent window
@@ -1293,6 +1401,15 @@ where
             .unwrap_or(U256::ZERO);
         if amount_wei.is_zero() {
             return Ok(());
+        }
+
+        // Guard: only buy if PnL >= 100% or pair age <= 30s
+        if let Some((pnl_pct, first_seen)) =
+            crate::app::pair_streams::pair_metrics(&pair_key.as_str())
+        {
+            if pnl_pct < 100.0 && first_seen.elapsed() > Duration::from_secs(30) {
+                return Ok(());
+            }
         }
 
         // TP/SL settings (mirror sim)
@@ -1346,6 +1463,8 @@ where
                     )
                     .await
                     {
+                        let mut trader = REAL_TRADER.lock().await;
+                        record_buy_failure(&mut trader, &pair_key);
                         return Ok(());
                     }
 
@@ -1378,6 +1497,7 @@ where
                         "[trade] ✓ V2 BUY {} via WBNB ({} BNB) tx={} token balance={}",
                         pair_info.symbol_base, buy_amount_bnb, tx, bal_after
                     ));
+                    clear_buy_failures(&pair_key);
                     if let Some(se_arc) = sim_engine {
                         let mut se = se_arc.lock().await;
                         let _ = se.submit_buy(
@@ -1433,6 +1553,8 @@ where
                     )
                     .await
                     {
+                        let mut trader = REAL_TRADER.lock().await;
+                        record_buy_failure(&mut trader, &pair_key);
                         return Ok(());
                     }
 
@@ -1465,6 +1587,7 @@ where
                         "[trade] ✓ V3 BUY {} via WBNB ({} BNB) tx={} token balance={}",
                         pair_info.symbol_base, buy_amount_bnb, tx, bal_after
                     ));
+                    clear_buy_failures(&pair_key);
                     if let Some(se_arc) = sim_engine {
                         let mut se = se_arc.lock().await;
                         let _ = se.submit_buy(
@@ -1511,7 +1634,7 @@ where
                 let router = FmRouter::new(provider.clone());
                 let bal_before = safe_balance_of(provider.clone(), token, from).await;
 
-                let (_est_amount, tx) = router
+                let buy_res = router
                     .buy_with_bnb_amap(
                         from,
                         token,
@@ -1520,8 +1643,24 @@ where
                         None,
                         Some(gas_price_wei_override),
                     )
-                    .await?;
+                    .await;
+                let (_est_amount, tx) = match buy_res {
+                    Ok(v) => {
+                        clear_buy_failures(&pair_key);
+                        v
+                    }
+                    Err(e) => {
+                        let mut trader = REAL_TRADER.lock().await;
+                        let attempts = record_buy_failure(&mut trader, &pair_key);
+                        save_log_to_file(&format!(
+                            "[trade] FM BUY failed {} attempts={} err={}",
+                            pair_key, attempts, e
+                        ));
+                        return Ok(());
+                    }
+                };
 
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                 let bal_after = safe_balance_of(provider.clone(), token, from).await;
                 if bal_after <= bal_before {
                     save_log_to_file(&format!(

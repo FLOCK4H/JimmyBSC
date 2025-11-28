@@ -149,6 +149,24 @@ pub fn cfg_bindings(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "5".to_string());
     }
+    if contains(config_areas.avoid_chinese_toggle) {
+        toggle_key(config_store, "avoid_chinese");
+        let _ = save_autotrade_cache(config_store);
+    }
+    if contains(config_areas.freshness_input) {
+        *focused_field = Some("freshness_secs".to_string());
+        *input_buffer = config_store
+            .get("freshness_secs")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "30".to_string());
+    }
+    if contains(config_areas.min_pnl_input) {
+        *focused_field = Some("min_pnl_pct".to_string());
+        *input_buffer = config_store
+            .get("min_pnl_pct")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "100".to_string());
+    }
     if contains(config_areas.wrap_ratio_input) {
         *focused_field = Some("wrap_ratio_pct".to_string());
         *input_buffer = config_store

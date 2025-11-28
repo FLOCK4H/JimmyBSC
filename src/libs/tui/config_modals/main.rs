@@ -13,7 +13,8 @@ pub fn draw_config_main(
     store: &ConfigStore,
     areas_out: &mut ConfigAreas,
     focused_field: Option<&str>,
-) {
+    scroll_offset: usize,
+) -> u16 {
     // Create a scroll-free layout; compute minimal heights by sections
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -30,7 +31,8 @@ pub fn draw_config_main(
     let _h1 = draw_enabled(f, layout[0], store, &mut areas);
     let _h2 = draw_dexes(f, layout[1], store, &mut areas);
     let _h3 = draw_buy_amount(f, layout[2], store, &mut areas, focused_field);
-    let _h4 = draw_advanced(f, layout[3], store, &mut areas, focused_field);
+    let rows_used = draw_advanced(f, layout[3], store, &mut areas, focused_field, scroll_offset);
 
     *areas_out = areas;
+    rows_used
 }

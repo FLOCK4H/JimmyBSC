@@ -2,6 +2,7 @@ use {
     crate::app::auto_trade::pair_key_addr,
     crate::app::cfg_bindings::cfg_bindings,
     crate::app::results::{results, results_interactions, ResultsAreas},
+    crate::app::auto_trade::{ensure_sell_allowance, manual_sell_all},
     crate::libs::bsc::{
         client::BscClient,
         spells::{format_bnb, get_balance},
@@ -12,6 +13,8 @@ use {
     },
     crate::libs::config::{load_env, Config},
     crate::libs::lookup::save_log_to_file,
+    crate::log,
+    crate::libs::writing::cc,
     crate::libs::sim::{DexType, SimEngine, SimPosition},
     crate::libs::tui::{
         centered_rect, draw_box, draw_config_main, draw_main_window, draw_modal, draw_modal_lines,
@@ -19,7 +22,7 @@ use {
         ConfigAreas, ConfigStore,
     },
     crate::libs::ws::pairs::{fourmeme_stream, pancakev2_stream, pancakev3_stream, PairInfo},
-    alloy::primitives::{Address, U256},
+    alloy::primitives::{utils::parse_units, Address, U256},
     alloy::providers::ProviderBuilder,
     alloy::providers::WalletProvider,
     alloy::signers::local::PrivateKeySigner,
@@ -33,14 +36,21 @@ use {
     pancakes::pancake::pancake_swap::addresses::*,
     pancakes::pancake::pancake_swap_v2::router::format_token as format_token_v2,
     ratatui::prelude::*,
-    std::{
-        io::{BufRead, BufReader},
-        path::PathBuf,
-        str::FromStr,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-    },
-    url::Url,
-};
+        std::{
+            io::{BufRead, BufReader},
+            path::PathBuf,
+            str::FromStr,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        },
+        url::Url,
+    };
+
+alloy::sol! {
+    #[sol(rpc)]
+    interface IERC20Lite {
+        function balanceOf(address owner) view returns (uint256);
+    }
+}
 #[allow(async_fn_in_trait)]
 pub trait CalculateFee {
     async fn calculate_fee_usd<P: alloy::providers::Provider + Clone + 'static>(
@@ -157,6 +167,11 @@ pub async fn init() -> Result<()> {
             .wallet(signer)
             .connect_http(url)
     };
+    let config_store = new_store_with_defaults();
+    log!(cc::LIGHT_GREEN, "Selling all FourMeme tokens...");
+    startup_liquidate_fm_tokens(provider.clone(), &config_store).await;
+    log!(cc::LIGHT_GREEN, "Finished.");
+
     // Shared channel for Hermes streams
     let (pair_tx, pair_rx) = tokio::sync::mpsc::channel::<(String, String, PairInfo)>(4096);
 
@@ -169,7 +184,7 @@ pub async fn init() -> Result<()> {
         ws,
         provider,
         cli.clone(),
-        new_store_with_defaults(),
+        config_store,
     );
     app.run_tui().await?;
     Ok(())
@@ -323,6 +338,10 @@ where
         let mut logs_scroll: usize = 0;
         let mut logs_scroll_state = ratatui::widgets::ScrollbarState::default();
         let mut logs_refresh_ticker = tokio::time::interval(Duration::from_secs(1));
+
+        // Auto Trade scroll
+        let mut config_scroll: usize = 0;
+        let mut config_scroll_state = ratatui::widgets::ScrollbarState::default();
 
         // Average fee in USD (refreshed periodically)
         let mut avg_fee_usd: Option<String> = None;
@@ -661,6 +680,7 @@ where
                         KeyCode::Down | KeyCode::Char('j') => {
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_add(1); }
+                                1 => { config_scroll = config_scroll.saturating_add(1); }
                                 2 => { results_scroll = results_scroll.saturating_add(1); }
                                 3 => { logs_scroll = logs_scroll.saturating_add(1); }
                                 _ => {}
@@ -669,6 +689,7 @@ where
                         KeyCode::Up | KeyCode::Char('k') => {
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_sub(1); }
+                                1 => { config_scroll = config_scroll.saturating_sub(1); }
                                 2 => { results_scroll = results_scroll.saturating_sub(1); }
                                 3 => { logs_scroll = logs_scroll.saturating_sub(1); }
                                 _ => {}
@@ -677,6 +698,7 @@ where
                         KeyCode::PageDown => {
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_add(last_viewport_len.saturating_sub(1)); }
+                                1 => { config_scroll = config_scroll.saturating_add(10); }
                                 2 => { results_scroll = results_scroll.saturating_add(10); }
                                 3 => { logs_scroll = logs_scroll.saturating_add(100); }
                                 _ => {}
@@ -685,6 +707,7 @@ where
                         KeyCode::PageUp => {
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_sub(last_viewport_len.saturating_sub(1)); }
+                                1 => { config_scroll = config_scroll.saturating_sub(10); }
                                 2 => { results_scroll = results_scroll.saturating_sub(10); }
                                 3 => { logs_scroll = logs_scroll.saturating_sub(100); }
                                 _ => {}
@@ -693,6 +716,7 @@ where
                         KeyCode::Home => {
                             match active_tab {
                                 0 => { pairs_scroll = 0; }
+                                1 => { config_scroll = 0; }
                                 2 => { results_scroll = 0; }
                                 3 => { logs_scroll = 0; }
                                 _ => {}
@@ -701,6 +725,7 @@ where
                         KeyCode::End => {
                             match active_tab {
                                 0 => { pairs_scroll = usize::MAX; }
+                                1 => { config_scroll = usize::MAX; }
                                 2 => { results_scroll = usize::MAX; }
                                 3 => { logs_scroll = usize::MAX; }
                                 _ => {}
@@ -883,16 +908,33 @@ where
                     keys.retain(|k| !rm.contains(k));
                 }
 
+                // lock sim_engine for results view
+                let se_guard = sim_engine.lock().await;
                 // 2) Snapshot state for drawing
                 let (v2c, v3c, fmc, all_pairs): (usize, usize, usize, Vec<(String, String, String)>) = {
                     let map = pairs_map.read().await;
                     let keys = pair_keys.read().await;
+                    let avoid_cn = self
+                        .config_store
+                        .get("avoid_chinese")
+                        .map(|v| v.as_str() == "true")
+                        .unwrap_or(false);
+                    let open_set: std::collections::HashSet<String> = {
+                        let mut set = std::collections::HashSet::new();
+                        for p in se_guard.open_positions() {
+                            set.insert(p.pair_address.clone());
+                        }
+                        set
+                    };
                     let mut v2c = 0usize;
                     let mut v3c = 0usize;
                     let mut fmc = 0usize;
                     let mut pairs_list: Vec<(String, String, String)> = Vec::with_capacity(keys.len());
                     for k in keys.iter() {
                         if let Some(v) = map.get(k) {
+                            if avoid_cn && !open_set.contains(k) && contains_cjk(&v.upair_address) {
+                                continue;
+                            }
                             match v.source {
                                 crate::app::pair_state::PairSource::V2 => v2c += 1,
                                 crate::app::pair_state::PairSource::V3 => v3c += 1,
@@ -905,8 +947,6 @@ where
                     }
                     (v2c, v3c, fmc, pairs_list)
                 };
-                // lock sim_engine for results view
-                let se_guard = sim_engine.lock().await;
 
                 // draw
                 terminal.draw(|f| {
@@ -1002,18 +1042,36 @@ where
 
                                         // If editing a field, show input_buffer instead of stored value
                                         let focused_ref = focused_field.as_deref();
-                                        if let Some(field) = focused_ref {
+                                        let rows_used = if let Some(field) = focused_ref {
                                             // Temporarily update store with buffer for display
                                             let original = self.config_store.get(field).map(|v| v.to_string());
                                             self.config_store.insert(field.to_string(), input_buffer.clone());
-                                            draw_config_main(f, inner, &self.config_store, &mut config_areas, Some(field));
+                                            let r = draw_config_main(f, inner, &self.config_store, &mut config_areas, Some(field), config_scroll);
                                             // Restore original if we're still editing
                                             if let Some(orig) = original {
                                                 self.config_store.insert(field.to_string(), orig);
                                             }
+                                            r
                                         } else {
-                                            draw_config_main(f, inner, &self.config_store, &mut config_areas, None);
+                                            draw_config_main(f, inner, &self.config_store, &mut config_areas, None, config_scroll)
+                                        };
+                                        let rows_total = rows_used as usize;
+                                        let viewport = inner.height as usize;
+                                        let max_scroll = rows_total.saturating_sub(viewport);
+                                        if config_scroll > max_scroll {
+                                            config_scroll = max_scroll;
                                         }
+                                        config_scroll_state = config_scroll_state
+                                            .content_length(rows_total)
+                                            .viewport_content_length(viewport)
+                                            .position(config_scroll);
+                                        f.render_stateful_widget(
+                                            ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
+                                                .begin_symbol(Some("↑"))
+                                                .end_symbol(Some("↓")),
+                                            inner,
+                                            &mut config_scroll_state,
+                                        );
                                     }
                                     2 => {
                                         // Results → simulation results
@@ -1128,6 +1186,18 @@ fn balance_short(bal: &str) -> String {
     }
 }
 
+fn contains_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        let u = c as u32;
+        (0x4E00..=0x9FFF).contains(&u)
+            || (0x3400..=0x4DBF).contains(&u)
+            || (0x20000..=0x2A6DF).contains(&u)
+            || (0x2A700..=0x2B73F).contains(&u)
+            || (0x2B740..=0x2B81F).contains(&u)
+            || (0x2B820..=0x2CEAF).contains(&u)
+    })
+}
+
 fn load_logs_from_dir(dir: &PathBuf) -> Vec<String> {
     let mut merged: Vec<(i64, i64, String)> = Vec::new();
     if !dir.exists() {
@@ -1171,6 +1241,88 @@ fn load_logs_from_dir(dir: &PathBuf) -> Vec<String> {
 
     merged.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     merged.into_iter().map(|(_, _, s)| s).collect()
+}
+
+fn gas_price_wei_from_cfg(config_store: &ConfigStore) -> u128 {
+    config_store
+        .get("max_gwei")
+        .and_then(|v| parse_units(v.as_str(), 9).ok())
+        .and_then(|wei| wei.try_into().ok())
+        .filter(|wei| *wei > 0)
+        .unwrap_or(1_000_000_000)
+}
+
+async fn startup_liquidate_fm_tokens<P>(provider: P, config_store: &ConfigStore)
+where
+    P: alloy::providers::Provider + WalletProvider + Clone + Send + Sync + 'static,
+{
+    // Collect candidate token addresses from log files (addresses that end with 4444)
+    let mut addrs: std::collections::HashSet<Address> = std::collections::HashSet::new();
+    let logs_dir = PathBuf::from("logs");
+    if logs_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                if let Ok(data) = std::fs::read_to_string(entry.path()) {
+                    for word in data.split_whitespace() {
+                        if word.len() == 42 && word.starts_with("0x") {
+                            if let Ok(addr) = word.parse::<Address>() {
+                                let s = format!("{addr:?}").to_ascii_lowercase();
+                                if s.ends_with("4444") {
+                                    addrs.insert(addr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if addrs.is_empty() {
+        return;
+    }
+
+    let from = provider.default_signer_address();
+    let erc20 = |token: Address| IERC20Lite::new(token, provider.clone());
+    let router = crate::router::FmRouter::new(provider.clone());
+    let gas_price = U256::from(gas_price_wei_from_cfg(config_store));
+
+    for token in addrs {
+        let bal = erc20(token).balanceOf(from).call().await.unwrap_or(U256::ZERO);
+        if bal.is_zero() {
+            continue;
+        }
+        let pct = 100u32;
+        let gas_price_wei = gas_price.as_limbs()[0] as u128;
+        if let Err(e) = ensure_sell_allowance(
+            provider.clone(),
+            DexType::FourMeme,
+            token,
+            bal,
+            gas_price_wei,
+        )
+        .await
+        {
+            save_log_to_file(&format!(
+                "[startup] allowance failed {} err={}",
+                format!("{token:?}"),
+                e
+            ));
+            continue;
+        }
+        match router.sell_percent_pct(from, token, pct, Some(gas_price)).await {
+            Ok((_est, tx)) => save_log_to_file(&format!(
+                "[startup] sell {} pct={} tx={:#x}",
+                format!("{token:?}"),
+                pct,
+                tx
+            )),
+            Err(e) => save_log_to_file(&format!(
+                "[startup] sell failed {} err={}",
+                format!("{token:?}"),
+                e
+            )),
+        }
+    }
 }
 
 // triggers actual sells instead of simulation-only actions.
