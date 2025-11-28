@@ -7,6 +7,7 @@ use {
     crate::libs::sim::{DexType, SimEngine},
     crate::libs::tui::ConfigStore,
     crate::libs::ws::pairs::PairInfo,
+    crate::shared::should_avoid_name,
     anyhow::{anyhow, Result},
     fourmeme::abi::ITokenManagerHelper3,
     fourmeme::addresses::TOKEN_MANAGER_HELPER_3,
@@ -97,8 +98,7 @@ fn record_buy_failure(trader: &mut RealTrader, pair_key: &str) -> u32 {
         trader.block_rebuy(pair_key);
         save_log_to_file(&format!(
             "[trade] SKIP {}: marked do-not-rebuy after {} failed attempts",
-            pair_key,
-            *cnt
+            pair_key, *cnt
         ));
     }
     *cnt
@@ -209,12 +209,8 @@ fn dex_to_market(dex: DexType) -> Option<AllowanceMarket> {
     }
 }
 
-fn queue_allowance_job<P>(
-    provider: P,
-    dex: DexType,
-    token: Address,
-    gas_price_wei: u128,
-) where
+fn queue_allowance_job<P>(provider: P, dex: DexType, token: Address, gas_price_wei: u128)
+where
     P: Provider + Clone + WalletProvider + Send + Sync + 'static,
 {
     let Some(market) = dex_to_market(dex) else {
@@ -310,7 +306,14 @@ where
             approve_once(provider, token, PANCAKE_V2_ROUTER, U256::MAX, gas_price_wei).await
         }
         AllowanceMarket::V3 => {
-            approve_once(provider, token, PANCAKE_V3_SWAP_ROUTER, U256::MAX, gas_price_wei).await
+            approve_once(
+                provider,
+                token,
+                PANCAKE_V3_SWAP_ROUTER,
+                U256::MAX,
+                gas_price_wei,
+            )
+            .await
         }
         AllowanceMarket::FourMeme => {
             let helper = ITokenManagerHelper3::new(TOKEN_MANAGER_HELPER_3, provider.clone());
@@ -382,14 +385,8 @@ where
             .await
         }
         DexType::FourMeme => {
-            send_allowance_with_retry(
-                provider,
-                AllowanceMarket::FourMeme,
-                token,
-                gas_price_wei,
-                2,
-            )
-            .await
+            send_allowance_with_retry(provider, AllowanceMarket::FourMeme, token, gas_price_wei, 2)
+                .await
         }
     }
 }
@@ -651,7 +648,11 @@ fn describe_trigger(trigger: &SellTrigger) -> String {
     }
 }
 
-async fn execute_sell_plan<P>(plan: &SellPlan, provider: P, config_store: &ConfigStore) -> Result<()>
+async fn execute_sell_plan<P>(
+    plan: &SellPlan,
+    provider: P,
+    config_store: &ConfigStore,
+) -> Result<()>
 where
     P: Provider + Clone + WalletProvider + Send + Sync + 'static,
 {
@@ -691,15 +692,14 @@ where
                 gas_price_wei,
             )
             .await?;
-            let (_quoted, tx) =
-                routy_v2::sell_pct_to_wbnb(
-                    &pancake,
-                    from,
-                    token_in_s.as_str(),
-                    percent_bps,
-                    Some(gas_price_wei),
-                )
-                    .await?;
+            let (_quoted, tx) = routy_v2::sell_pct_to_wbnb(
+                &pancake,
+                from,
+                token_in_s.as_str(),
+                percent_bps,
+                Some(gas_price_wei),
+            )
+            .await?;
             let bal_after = safe_balance_of(provider.clone(), plan.token_out, from).await;
             let final_after = if bal_after < bal_before {
                 Some(bal_after)
@@ -743,15 +743,14 @@ where
                 gas_price_wei,
             )
             .await?;
-            let (_quoted, tx) =
-                routy_v3::sell_pct_to_wbnb(
-                    &pancake,
-                    from,
-                    token_in_s.as_str(),
-                    percent_bps,
-                    Some(gas_price_wei),
-                )
-                    .await?;
+            let (_quoted, tx) = routy_v3::sell_pct_to_wbnb(
+                &pancake,
+                from,
+                token_in_s.as_str(),
+                percent_bps,
+                Some(gas_price_wei),
+            )
+            .await?;
             let bal_after = safe_balance_of(provider.clone(), plan.token_out, from).await;
             let final_after = if bal_after < bal_before {
                 Some(bal_after)
@@ -800,8 +799,9 @@ where
                 plan.percent_points.max(1),
                 Some(gas_price_wei_override),
             );
-            let sell_res =
-                tokio::time::timeout(Duration::from_secs(20), sell_call).await.map_err(|_| {
+            let sell_res = tokio::time::timeout(Duration::from_secs(20), sell_call)
+                .await
+                .map_err(|_| {
                     anyhow!(
                         "sell timeout for token {:#x} pct {}",
                         plan.token_out,
@@ -968,7 +968,16 @@ where
         trader.positions.keys().cloned().collect()
     };
     for k in keys {
-        match manual_sell(&k, 100, provider.clone(), sim_engine, sold_pairs, config_store).await {
+        match manual_sell(
+            &k,
+            100,
+            provider.clone(),
+            sim_engine,
+            sold_pairs,
+            config_store,
+        )
+        .await
+        {
             Ok(true) => {
                 // successfully sent a sell tx
             }
@@ -1003,10 +1012,7 @@ pub async fn manual_remove_position(
         removed |= se.remove_position(&pair_address);
     }
     if removed {
-        save_log_to_file(&format!(
-            "[trade] manual REMOVE applied: {}",
-            pair_address
-        ));
+        save_log_to_file(&format!("[trade] manual REMOVE applied: {}", pair_address));
     } else {
         save_log_to_file(&format!(
             "[trade] manual REMOVE ignored: {} (no position)",
@@ -1050,6 +1056,11 @@ pub async fn auto_trade(
                     if avoid_cn
                         && (contains_cjk(&pair_info.symbol_base)
                             || contains_cjk(&pair_info.symbol_quote))
+                    {
+                        return Ok(());
+                    }
+                    if should_avoid_name(&pair_info.symbol_base)
+                        || should_avoid_name(&pair_info.symbol_quote)
                     {
                         return Ok(());
                     }
@@ -1166,10 +1177,9 @@ pub async fn auto_trade(
                             _ => DexType::V2,
                         };
 
-                        if let Some((pnl_pct, first_seen)) =
-                            pair_metrics(&pair_addr_str.as_str())
-                        {
-                            if pnl_pct < min_pnl_pct && first_seen.elapsed().as_secs() > freshness_secs
+                        if let Some((pnl_pct, first_seen)) = pair_metrics(&pair_addr_str.as_str()) {
+                            if pnl_pct < min_pnl_pct
+                                && first_seen.elapsed().as_secs() > freshness_secs
                             {
                                 return Ok(());
                             }
@@ -1285,6 +1295,9 @@ where
         if avoid_cn
             && (contains_cjk(&pair_info.symbol_base) || contains_cjk(&pair_info.symbol_quote))
         {
+            return Ok(());
+        }
+        if should_avoid_name(&pair_info.symbol_base) || should_avoid_name(&pair_info.symbol_quote) {
             return Ok(());
         }
 
@@ -1473,15 +1486,14 @@ where
                     let dex_type = DexType::V2;
                     let pancake = PancakeV2::new(provider.clone());
                     let token_out_s = format!("{:#x}", token_out);
-                    let (_quoted, tx) =
-                        routy_v2::swap_wbnb_to(
-                            &pancake,
-                            from,
-                            token_out_s.as_str(),
-                            amount_wei,
-                            Some(gas_price_wei),
-                        )
-                        .await?;
+                    let (_quoted, tx) = routy_v2::swap_wbnb_to(
+                        &pancake,
+                        from,
+                        token_out_s.as_str(),
+                        amount_wei,
+                        Some(gas_price_wei),
+                    )
+                    .await?;
 
                     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                     let bal_after = safe_balance_of(provider.clone(), token_out, from).await;
@@ -1563,15 +1575,14 @@ where
                     let dex_type = DexType::V3;
                     let pancake = PancakeV3::new(provider.clone());
                     let token_out_s = format!("{:#x}", token_out);
-                    let (_quoted, tx) =
-                        routy_v3::swap_wbnb_to(
-                            &pancake,
-                            from,
-                            token_out_s.as_str(),
-                            amount_wei,
-                            Some(gas_price_wei),
-                        )
-                        .await?;
+                    let (_quoted, tx) = routy_v3::swap_wbnb_to(
+                        &pancake,
+                        from,
+                        token_out_s.as_str(),
+                        amount_wei,
+                        Some(gas_price_wei),
+                    )
+                    .await?;
                     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
                     let bal_after = safe_balance_of(provider.clone(), token_out, from).await;

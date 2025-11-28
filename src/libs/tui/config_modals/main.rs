@@ -31,7 +31,14 @@ pub fn draw_config_main(
     let _h1 = draw_enabled(f, layout[0], store, &mut areas);
     let _h2 = draw_dexes(f, layout[1], store, &mut areas);
     let _h3 = draw_buy_amount(f, layout[2], store, &mut areas, focused_field);
-    let rows_used = draw_advanced(f, layout[3], store, &mut areas, focused_field, scroll_offset);
+    let rows_used = draw_advanced(
+        f,
+        layout[3],
+        store,
+        &mut areas,
+        focused_field,
+        scroll_offset,
+    );
 
     *areas_out = areas;
     rows_used

@@ -4,7 +4,7 @@ use alloy::primitives::keccak256;
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::Filter;
 use futures_util::future::join3;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use pancakes::pancake::pancake_swap::addresses::PANCAKE_V3_FACTORY;
 use pancakes::pancake::pancake_swap_v2::addresses::PANCAKE_V2_FACTORY;
@@ -14,6 +14,8 @@ use pancakes::plug::{enrich_v3_pool_created, try_parse_v3_pool_topics};
 use crate::libs::bsc::client::BscWsClient;
 use crate::libs::lookup::addr_to_symbol;
 use crate::libs::lookup::{save_log_to_file, trim_chars};
+use crate::libs::ws::swap_aggregator::SwapAggregator;
+use crate::libs::ws::swaps::{track_v2_pair_swaps, track_v3_pool_swaps, SwapEvent};
 use alloy::primitives::{Address, B256, U256};
 use pancakes::pancake::pancake_swap::addresses::*;
 use pancakes::pancake::pancake_swap::router::format_token as fmt_token;
@@ -78,6 +80,8 @@ pub async fn pancakev2_stream(
     tx_v2: mpsc::Sender<(String, String, PairInfo)>,
     ws_v2: BscWsClient,
     provider_v2: impl Provider + Clone + 'static,
+    swap_tx: mpsc::Sender<SwapEvent>,
+    swap_agg: SwapAggregator,
 ) {
     let topic0 = v2_pair_created_topic();
     let base_filter = Filter::new()
@@ -86,6 +90,7 @@ pub async fn pancakev2_stream(
 
     // bound concurrent enrichers to avoid CPU/RPC stalls blocking the receiver
     let sem = Arc::new(Semaphore::new(64));
+    let tracked_pairs: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
         let filter = base_filter.clone();
@@ -97,6 +102,10 @@ pub async fn pancakev2_stream(
                         let permit = sem.clone().acquire_owned().await.unwrap();
                         let tx = tx_v2.clone();
                         let prov = provider_v2.clone();
+                        let swap_tx_c = swap_tx.clone();
+                        let swap_agg_c = swap_agg.clone();
+                        let tracked_pairs_c = tracked_pairs.clone();
+                        let ws_for_swaps = ws_v2.clone();
                         // Parse non-indexed `pair` field from event data if present:
                         // PairCreated(address indexed token0, address indexed token1, address pair, uint)
                         // -> first 32 bytes of data contain the pair address (right-most 20 bytes)
@@ -153,6 +162,26 @@ pub async fn pancakev2_stream(
                                         );
                                         return;
                                     }
+                                }
+
+                                let is_token0_base = base == info.token0;
+                                let should_track = {
+                                    let mut guard = tracked_pairs_c.lock().await;
+                                    guard.insert(pair_addr)
+                                };
+                                if should_track {
+                                    let ws_swaps = ws_for_swaps.clone();
+                                    let swap_tx_pair = swap_tx_c.clone();
+                                    tokio::spawn(async move {
+                                        track_v2_pair_swaps(
+                                            pair_addr,
+                                            base,
+                                            is_token0_base,
+                                            ws_swaps,
+                                            swap_tx_pair,
+                                        )
+                                        .await;
+                                    });
                                 }
 
                                 let joined = tokio::time::timeout(
@@ -219,6 +248,8 @@ pub async fn pancakev2_stream(
                                     format!("{:#x}", pair_addr)
                                 );
 
+                                let (buy_count, sell_count, unique_buyers) =
+                                    swap_agg_c.get_stats(&pair_addr).await;
                                 let pair_info = PairInfo {
                                     addr1: info.token0,
                                     addr2: info.token1,
@@ -228,9 +259,9 @@ pub async fn pancakev2_stream(
                                     symbol_base: sym_base.clone(),
                                     symbol_quote: sym_quote.clone(),
                                     liquidity_usd: parse_liquidity_usd(&liq_s_raw),
-                                    buy_count: 0,
-                                    sell_count: 0,
-                                    unique_buyers: 0,
+                                    buy_count,
+                                    sell_count,
+                                    unique_buyers,
                                 };
 
                                 // initial delivery must not drop
@@ -241,11 +272,9 @@ pub async fn pancakev2_stream(
                                 // refresh ticker stays best-effort
                                 let prov_r = prov.clone();
                                 let tx_r = tx.clone();
+                                let swap_agg_r = swap_agg_c.clone();
                                 tokio::spawn(async move {
                                     let mut ticker = tokio::time::interval(Duration::from_secs(3));
-                                    let mut buy_count = 0u32;
-                                    let mut sell_count = 0u32;
-                                    let mut last_price: Option<f64> = None;
 
                                     loop {
                                         ticker.tick().await;
@@ -274,28 +303,10 @@ pub async fn pancakev2_stream(
 
                                         let price_r =
                                             match get_price_v2(prov_r.clone(), base, quote).await {
-                                                Ok(q) => {
-                                                    let s = fmt_token(
-                                                        q.amount_out_base_units,
-                                                        q.decimals_out,
-                                                    );
-                                                    let raw = q
-                                                        .amount_out_base_units
-                                                        .to_string()
-                                                        .parse::<f64>()
-                                                        .unwrap_or(0.0);
-                                                    let divisor = 10f64.powi(q.decimals_out as i32);
-                                                    let current = raw / divisor;
-                                                    if let Some(prev) = last_price {
-                                                        if current > prev {
-                                                            buy_count += 1;
-                                                        } else if current < prev {
-                                                            sell_count += 1;
-                                                        }
-                                                    }
-                                                    last_price = Some(current);
-                                                    s
-                                                }
+                                                Ok(q) => fmt_token(
+                                                    q.amount_out_base_units,
+                                                    q.decimals_out,
+                                                ),
                                                 Err(_) => price.clone(),
                                             };
 
@@ -306,6 +317,8 @@ pub async fn pancakev2_stream(
                                             liq_s_r,
                                             trim_chars(&price_r, 13)
                                         );
+                                        let (buy_count, sell_count, unique_buyers) =
+                                            swap_agg_r.get_stats(&pair_addr).await;
                                         let pair_info_r = PairInfo {
                                             addr1: info.token0,
                                             addr2: info.token1,
@@ -318,7 +331,7 @@ pub async fn pancakev2_stream(
                                                 .and_then(|s| parse_liquidity_usd(&s)),
                                             buy_count,
                                             sell_count,
-                                            unique_buyers: 0,
+                                            unique_buyers,
                                         };
                                         let _ = tx_r.try_send((line1_r, link.clone(), pair_info_r));
                                     }
@@ -342,6 +355,8 @@ pub async fn pancakev3_stream(
     tx_v3: mpsc::Sender<(String, String, PairInfo)>,
     ws_v3: BscWsClient,
     provider_v3: impl Provider + Clone + 'static,
+    swap_tx: mpsc::Sender<SwapEvent>,
+    swap_agg: SwapAggregator,
 ) {
     let topic0 = keccak256("PoolCreated(address,address,uint24,int24,address)".as_bytes());
     let base_filter = Filter::new()
@@ -351,6 +366,7 @@ pub async fn pancakev3_stream(
     use std::sync::Arc;
     use tokio::sync::Semaphore;
     let sem = Arc::new(Semaphore::new(64)); // limit concurrent enrichers
+    let tracked_pools: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
         let filter = base_filter.clone();
@@ -362,6 +378,10 @@ pub async fn pancakev3_stream(
                         let permit = sem.clone().acquire_owned().await.unwrap();
                         let tx = tx_v3.clone();
                         let prov = provider_v3.clone();
+                        let swap_tx_c = swap_tx.clone();
+                        let swap_agg_c = swap_agg.clone();
+                        let tracked_pools_c = tracked_pools.clone();
+                        let ws_for_swaps = ws_v3.clone();
 
                         tokio::spawn(async move {
                             let _p = permit;
@@ -426,6 +446,26 @@ pub async fn pancakev3_stream(
                                     }
                                 }
 
+                                let is_token0_base = base == info.token0;
+                                let should_track = {
+                                    let mut guard = tracked_pools_c.lock().await;
+                                    guard.insert(pool_addr)
+                                };
+                                if should_track {
+                                    let ws_swaps = ws_for_swaps.clone();
+                                    let swap_tx_pair = swap_tx_c.clone();
+                                    tokio::spawn(async move {
+                                        track_v3_pool_swaps(
+                                            pool_addr,
+                                            base,
+                                            is_token0_base,
+                                            ws_swaps,
+                                            swap_tx_pair,
+                                        )
+                                        .await;
+                                    });
+                                }
+
                                 let (liq_q_units, dec_q) =
                                     match get_liquidity_v3(prov.clone(), pool_addr, quote).await {
                                         Ok(t) => t,
@@ -453,6 +493,8 @@ pub async fn pancakev3_stream(
                                     s2.parse::<f64>().ok()
                                 };
 
+                                let (buy_count, sell_count, unique_buyers) =
+                                    swap_agg_c.get_stats(&pool_addr).await;
                                 let pair_info = PairInfo {
                                     addr1: info.token0,
                                     addr2: info.token1,
@@ -462,9 +504,9 @@ pub async fn pancakev3_stream(
                                     symbol_base: sym_base.clone(),
                                     symbol_quote: sym_quote.clone(),
                                     liquidity_usd,
-                                    buy_count: 0,
-                                    sell_count: 0,
-                                    unique_buyers: 0,
+                                    buy_count,
+                                    sell_count,
+                                    unique_buyers,
                                 };
 
                                 // FIRST publish must never drop
@@ -480,13 +522,10 @@ pub async fn pancakev3_stream(
                                 let fee = info.fee;
                                 let tick_spacing = info.tick_spacing;
                                 let pool_addr_captured = pool_addr;
-                                let initial_price = extract_price_f64(&line1);
+                                let swap_agg_r = swap_agg_c.clone();
 
                                 tokio::spawn(async move {
                                     let mut ticker = tokio::time::interval(Duration::from_secs(3));
-                                    let mut last_price = initial_price;
-                                    let mut buy_count = 0u32;
-                                    let mut sell_count = 0u32;
 
                                     loop {
                                         ticker.tick().await;
@@ -496,23 +535,6 @@ pub async fn pancakev3_stream(
                                         {
                                             let price_refresh =
                                                 fmt_token(q.amount_out_base_units, q.decimals_out);
-                                            let raw = q
-                                                .amount_out_base_units
-                                                .to_string()
-                                                .parse::<f64>()
-                                                .unwrap_or(0.0);
-                                            let divisor = 10f64.powi(q.decimals_out as i32);
-                                            let current_price = raw / divisor;
-                                            if current_price > 0.0 {
-                                                if let Some(prev) = last_price {
-                                                    if current_price > prev * 1.001 {
-                                                        buy_count += 1;
-                                                    } else if current_price < prev * 0.999 {
-                                                        sell_count += 1;
-                                                    }
-                                                }
-                                                last_price = Some(current_price);
-                                            }
 
                                             let (liq_q_units, dec_q) = match get_liquidity_v3(
                                                 prov_r.clone(),
@@ -549,6 +571,8 @@ pub async fn pancakev3_stream(
                                                 liq_s_refresh,
                                                 price_refresh
                                             );
+                                            let (buy_count, sell_count, unique_buyers) =
+                                                swap_agg_r.get_stats(&pool_addr_captured).await;
                                             let pair_info_refresh = PairInfo {
                                                 addr1: base,
                                                 addr2: quote,
@@ -560,7 +584,7 @@ pub async fn pancakev3_stream(
                                                 liquidity_usd: liquidity_usd_refresh,
                                                 buy_count,
                                                 sell_count,
-                                                unique_buyers: 0,
+                                                unique_buyers,
                                             };
                                             let _ = tx_r.try_send((
                                                 line1_refresh,
@@ -892,13 +916,34 @@ pub fn spawn_pair_streams<P: Provider + Clone + Send + Sync + 'static>(
         let provider_v2 = provider.clone();
         let provider_v3 = provider.clone();
         let provider_fm = provider.clone();
+        let swap_agg = SwapAggregator::new();
+        let (swap_tx, swap_rx) = mpsc::channel::<SwapEvent>(4096);
+        swap_agg.spawn_processor(swap_rx);
+        let swap_tx_v2 = swap_tx.clone();
+        let swap_tx_v3 = swap_tx.clone();
+        let swap_agg_v2 = swap_agg.clone();
+        let swap_agg_v3 = swap_agg.clone();
 
         let v2_task = tokio::spawn(async move {
-            pancakev2_stream(tx_v2.clone(), ws_v2, provider_v2).await;
+            pancakev2_stream(
+                tx_v2.clone(),
+                ws_v2,
+                provider_v2,
+                swap_tx_v2,
+                swap_agg_v2,
+            )
+            .await;
         });
 
         let v3_task = tokio::spawn(async move {
-            pancakev3_stream(tx_v3.clone(), ws_v3, provider_v3).await;
+            pancakev3_stream(
+                tx_v3.clone(),
+                ws_v3,
+                provider_v3,
+                swap_tx_v3,
+                swap_agg_v3,
+            )
+            .await;
         });
 
         let fm_task = tokio::spawn(async move {

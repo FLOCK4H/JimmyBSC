@@ -1,8 +1,8 @@
 use {
     crate::app::auto_trade::pair_key_addr,
+    crate::app::auto_trade::{ensure_sell_allowance, manual_sell_all},
     crate::app::cfg_bindings::cfg_bindings,
     crate::app::results::{results, results_interactions, ResultsAreas},
-    crate::app::auto_trade::{ensure_sell_allowance, manual_sell_all},
     crate::libs::bsc::{
         client::BscClient,
         spells::{format_bnb, get_balance},
@@ -13,15 +13,17 @@ use {
     },
     crate::libs::config::{load_env, Config},
     crate::libs::lookup::save_log_to_file,
-    crate::log,
-    crate::libs::writing::cc,
     crate::libs::sim::{DexType, SimEngine, SimPosition},
     crate::libs::tui::{
         centered_rect, draw_box, draw_config_main, draw_main_window, draw_modal, draw_modal_lines,
         draw_modal_pairs, draw_tab_strip, draw_title_bar, new_store_with_defaults, BoxProps,
         ConfigAreas, ConfigStore,
     },
+    crate::libs::writing::cc,
     crate::libs::ws::pairs::{fourmeme_stream, pancakev2_stream, pancakev3_stream, PairInfo},
+    crate::libs::ws::swap_aggregator::SwapAggregator,
+    crate::libs::ws::swaps::SwapEvent,
+    crate::log,
     alloy::primitives::{utils::parse_units, Address, U256},
     alloy::providers::ProviderBuilder,
     alloy::providers::WalletProvider,
@@ -36,14 +38,14 @@ use {
     pancakes::pancake::pancake_swap::addresses::*,
     pancakes::pancake::pancake_swap_v2::router::format_token as format_token_v2,
     ratatui::prelude::*,
-        std::{
-            io::{BufRead, BufReader},
-            path::PathBuf,
-            str::FromStr,
-            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-        },
-        url::Url,
-    };
+    std::{
+        io::{BufRead, BufReader},
+        path::PathBuf,
+        str::FromStr,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    },
+    url::Url,
+};
 
 alloy::sol! {
     #[sol(rpc)]
@@ -420,6 +422,9 @@ where
             let (_tx, rx) = tokio::sync::mpsc::channel::<(String, String, PairInfo)>(1);
             rx
         });
+        let swap_agg = SwapAggregator::new();
+        let (swap_tx, swap_rx) = tokio::sync::mpsc::channel::<SwapEvent>(4096);
+        swap_agg.spawn_processor(swap_rx);
 
         let dexes_enabled = |csv: &str| -> (bool, bool, bool) {
             let lower = csv.to_ascii_lowercase();
@@ -441,8 +446,10 @@ where
                 let tx = pair_tx.clone();
                 let ws_c = ws.clone();
                 let prov = provider.clone();
+                let swap_tx_c = swap_tx.clone();
+                let swap_agg_c = swap_agg.clone();
                 stream_handles.v2 = Some(tokio::spawn(async move {
-                    pancakev2_stream(tx, ws_c, prov).await;
+                    pancakev2_stream(tx, ws_c, prov, swap_tx_c, swap_agg_c).await;
                 }));
             } else if !want_v2 {
                 if let Some(h) = stream_handles.v2.take() {
@@ -454,8 +461,10 @@ where
                 let tx = pair_tx.clone();
                 let ws_c = ws.clone();
                 let prov = provider.clone();
+                let swap_tx_c = swap_tx.clone();
+                let swap_agg_c = swap_agg.clone();
                 stream_handles.v3 = Some(tokio::spawn(async move {
-                    pancakev3_stream(tx, ws_c, prov).await;
+                    pancakev3_stream(tx, ws_c, prov, swap_tx_c, swap_agg_c).await;
                 }));
             } else if !want_v3 {
                 if let Some(h) = stream_handles.v3.take() {
@@ -533,7 +542,11 @@ where
                         .unwrap_or_else(|| "v2,v3,fm".to_string());
                     let (en_v2, en_v3, en_fm) = {
                         let lower = dexes_csv.to_ascii_lowercase();
-                        (lower.contains("v2"), lower.contains("v3"), lower.contains("fm"))
+                        (
+                            lower.contains("v2"),
+                            lower.contains("v3"),
+                            lower.contains("fm"),
+                        )
                     };
                     let src = crate::app::pair_state::detect_source(&l1);
                     let allowed = match src {
@@ -954,9 +967,11 @@ where
                     draw_main_window(f, size);
                     if size.height < *crate::shared::MIN_TERMINAL_HEIGHT {
                         let area = centered_rect(70, 30, size);
+                        let min_height = *crate::shared::MIN_TERMINAL_HEIGHT;
+                        let min_height_str = format!("Minimum height required: {} rows.", min_height);
                         let lines = [
                             "Terminal too small to render UI.",
-                            "Minimum height required: 70 rows.",
+                            min_height_str.as_str(),
                             "Please resize your terminal window.",
                         ];
                         draw_modal(f, area, "Resize Needed", &lines);
@@ -1214,10 +1229,7 @@ fn load_logs_from_dir(dir: &PathBuf) -> Vec<String> {
         if !path.is_file() {
             continue;
         }
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("log");
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("log");
         let modified = entry
             .metadata()
             .ok()
@@ -1287,7 +1299,11 @@ where
     let gas_price = U256::from(gas_price_wei_from_cfg(config_store));
 
     for token in addrs {
-        let bal = erc20(token).balanceOf(from).call().await.unwrap_or(U256::ZERO);
+        let bal = erc20(token)
+            .balanceOf(from)
+            .call()
+            .await
+            .unwrap_or(U256::ZERO);
         if bal.is_zero() {
             continue;
         }
@@ -1309,7 +1325,10 @@ where
             ));
             continue;
         }
-        match router.sell_percent_pct(from, token, pct, Some(gas_price)).await {
+        match router
+            .sell_percent_pct(from, token, pct, Some(gas_price))
+            .await
+        {
             Ok((_est, tx)) => save_log_to_file(&format!(
                 "[startup] sell {} pct={} tx={:#x}",
                 format!("{token:?}"),
@@ -1423,10 +1442,9 @@ pub async fn results_interactions_real<P>(
         if contains_rect(*r) {
             save_log_to_file(&format!("[trade] manual REMOVE requested: {}", pair_addr));
             match crate::app::auto_trade::manual_remove_position(&pair_addr, &sim_engine).await {
-                Ok(true) => save_log_to_file(&format!(
-                    "[trade] manual REMOVE applied: {}",
-                    pair_addr
-                )),
+                Ok(true) => {
+                    save_log_to_file(&format!("[trade] manual REMOVE applied: {}", pair_addr))
+                }
                 Ok(false) => save_log_to_file(&format!(
                     "[trade] manual REMOVE ignored: {} (no position)",
                     pair_addr

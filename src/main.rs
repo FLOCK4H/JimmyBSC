@@ -20,9 +20,9 @@ pub fn format_bnb_hum(amount: String) -> U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::U256;
     use std::str::FromStr;
     use url::Url;
-    use alloy::primitives::U256;
 
     use anyhow::Result;
 
@@ -144,7 +144,14 @@ mod tests {
 
         let router = jimmyb::router::FmRouter::new(provider.clone());
         let (est_amount, tx) = router
-            .buy_with_bnb_amap(from, token, funds, slippage_bps, None, U256::ZERO.try_into().unwrap())
+            .buy_with_bnb_amap(
+                from,
+                token,
+                funds,
+                slippage_bps,
+                None,
+                U256::ZERO.try_into().unwrap(),
+            )
             .await?;
 
         let decs = fm_token_decimals(provider.clone(), token).await;
@@ -182,7 +189,9 @@ mod tests {
             .unwrap_or(100);
 
         let router = jimmyb::router::FmRouter::new(provider.clone());
-        let (est_funds, tx) = router.sell_percent_pct(from, token, pct_points, U256::ZERO.try_into().unwrap()).await?;
+        let (est_funds, tx) = router
+            .sell_percent_pct(from, token, pct_points, U256::ZERO.try_into().unwrap())
+            .await?;
 
         let est_funds_str = fourmeme::price::format_units(est_funds, 18);
         log!(

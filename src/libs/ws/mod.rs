@@ -1,3 +1,3 @@
 pub mod pairs;
-// pub mod swaps;
-// pub mod swap_aggregator;
+pub mod swap_aggregator;
+pub mod swaps;

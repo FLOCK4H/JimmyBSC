@@ -469,7 +469,7 @@ pub fn results_interactions(
     // Partial sell buttons
     for (r, pair_addr, fraction) in results_areas.partial_btns.iter() {
         if contains_rect(*r) {
-            if sim_engine.position_needs_liq_ack(pair_addr) {   
+            if sim_engine.position_needs_liq_ack(pair_addr) {
                 break;
             }
             if let Some((realized, closed_now)) = sim_engine.partial_take(pair_addr, *fraction) {

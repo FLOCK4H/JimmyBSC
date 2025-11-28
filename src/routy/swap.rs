@@ -27,6 +27,16 @@ pub async fn swap_wbnb_to_token_simple<P: Provider + Clone>(
     bnb_in_amount: U256,
 ) -> Result<(U256, TxHash)> {
     pancake
-        .swap_wbnb_to_token(from, token_out, bnb_in_amount, 500, 50, from, 300, false, None)
+        .swap_wbnb_to_token(
+            from,
+            token_out,
+            bnb_in_amount,
+            500,
+            50,
+            from,
+            300,
+            false,
+            None,
+        )
         .await
 }

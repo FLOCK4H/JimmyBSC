@@ -1,7 +1,7 @@
-use anyhow::{bail, Result};
 use crate::libs::lookup::save_log_to_file;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
+use anyhow::{bail, Result};
 
 use fourmeme::abi::{ITokenManager2, ITokenManagerHelper3};
 use fourmeme::addresses::TOKEN_MANAGER_HELPER_3;
@@ -72,11 +72,11 @@ impl<P: Provider + Clone> FmRouter<P> {
                 .buyTokenAMAP_0(token, funds_wei, min_amount)
                 .from(from)
                 .value(funds_wei);
-    
+
             if let Some(gp) = gas_price_wei {
                 call = call.gas_price(gp.try_into().unwrap());
             }
-    
+
             let pending = call.send().await?;
             let tx = *pending.tx_hash();
             let _ = pending.get_receipt().await;
@@ -86,11 +86,11 @@ impl<P: Provider + Clone> FmRouter<P> {
                 .buyWithEth(U256::ZERO, token, to, funds_wei, min_amount)
                 .from(from)
                 .value(funds_wei);
-    
+
             if let Some(gp) = gas_price_wei {
                 call = call.gas_price(gp.try_into().unwrap());
             }
-    
+
             let pending = call.send().await?;
             let tx = *pending.tx_hash();
             let _ = pending.get_receipt().await;

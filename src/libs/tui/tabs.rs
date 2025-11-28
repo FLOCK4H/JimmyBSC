@@ -39,9 +39,11 @@ pub fn draw_tab_strip(
         };
 
         let label = format!(" {} ", labels[i]);
-        let style = Style::default()
-            .fg(fg)
-            .add_modifier(if is_active { Modifier::BOLD } else { Modifier::empty() });
+        let style = Style::default().fg(fg).add_modifier(if is_active {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
         let p = ratatui::widgets::Paragraph::new(Line::from(Span::styled(label, style)))
             .alignment(Alignment::Center);
         f.render_widget(p, rect);

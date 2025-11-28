@@ -1,12 +1,14 @@
-    use {
-        crate::app::auto_trade::pair_key_addr,
-        crate::app::pair_state::{detect_source, extract_price_f64, PairState},
-        crate::libs::ws::pairs::PairInfo,
-        once_cell::sync::Lazy,
-        std::collections::{HashMap, HashSet, VecDeque},
-        std::sync::RwLock,
-        std::time::Instant,
-    };
+
+use {
+    crate::app::auto_trade::pair_key_addr,
+    crate::app::pair_state::{detect_source, extract_price_f64, PairState},
+    crate::libs::ws::pairs::PairInfo,
+    crate::shared::should_avoid_name,
+    once_cell::sync::Lazy,
+    std::collections::{HashMap, HashSet, VecDeque},
+    std::sync::RwLock,
+    std::time::Instant,
+};
 
 static PAIR_METRICS: Lazy<RwLock<HashMap<String, (f64, Instant)>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -47,7 +49,6 @@ pub fn update_pairs_state(
     // Remove if price explicitly zero
     if let Some(p) = price_opt {
         if p == 0.0 {
-
             let existed = pairs_map.remove(&pair_key_addr(pair_info.pair)).is_some();
             if existed {
                 pair_keys.retain(|k| k != &pair_key_addr(pair_info.pair));
@@ -98,6 +99,9 @@ pub fn update_pairs_state(
     } else {
         // Freeze intake if MAX_PAIRS reached; only update existing entries above
         if pair_keys.len() >= max_pairs {
+            return;
+        }
+        if should_avoid_name(&pair_info.symbol_base) || should_avoid_name(&pair_info.symbol_quote) {
             return;
         }
         let nowi = Instant::now();

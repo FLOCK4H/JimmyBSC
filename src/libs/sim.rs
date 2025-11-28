@@ -81,6 +81,12 @@ impl SimPosition {
     }
 
     pub fn update_liquidity(&mut self, liquidity: Option<f64>) {
+        if matches!(self.dex_type, DexType::FourMeme) {
+            self.out_of_liq = false;
+            self.needs_liq_ack = false;
+            self.liquidity_usd = liquidity;
+            return;
+        }
         self.liquidity_usd = liquidity;
         if let Some(liq) = liquidity {
             if liq < 5.0 {

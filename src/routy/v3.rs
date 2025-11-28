@@ -39,7 +39,17 @@ pub async fn swap_wbnb_to<P: Provider + Clone>(
     gas_price_wei: Option<u128>,
 ) -> Result<(U256, TxHash)> {
     pancake
-        .swap_wbnb_to_token(from, token_out, bnb_in_amount, 500, 50, from, 300, false, gas_price_wei)
+        .swap_wbnb_to_token(
+            from,
+            token_out,
+            bnb_in_amount,
+            500,
+            50,
+            from,
+            300,
+            false,
+            gas_price_wei,
+        )
         .await
 }
 
