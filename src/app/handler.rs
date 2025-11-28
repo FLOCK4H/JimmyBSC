@@ -18,8 +18,8 @@ use {
         draw_modal_pairs, draw_tab_strip, draw_title_bar, new_store_with_defaults, BoxProps,
         ConfigAreas, ConfigStore,
     },
-    crate::libs::ws::pairs::{spawn_pair_streams, PairInfo},
-    alloy::primitives::U256,
+    crate::libs::ws::pairs::{fourmeme_stream, pancakev2_stream, pancakev3_stream, PairInfo},
+    alloy::primitives::{Address, U256},
     alloy::providers::ProviderBuilder,
     alloy::providers::WalletProvider,
     alloy::signers::local::PrivateKeySigner,
@@ -33,8 +33,12 @@ use {
     pancakes::pancake::pancake_swap::addresses::*,
     pancakes::pancake::pancake_swap_v2::router::format_token as format_token_v2,
     ratatui::prelude::*,
-    std::str::FromStr,
-    std::time::{Duration, Instant},
+    std::{
+        io::{BufRead, BufReader},
+        path::PathBuf,
+        str::FromStr,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    },
     url::Url,
 };
 #[allow(async_fn_in_trait)]
@@ -153,13 +157,16 @@ pub async fn init() -> Result<()> {
             .wallet(signer)
             .connect_http(url)
     };
-    let (pairs_rx, _pairs_handle) = spawn_pair_streams(provider.clone(), ws.clone())?;
+    // Shared channel for Hermes streams
+    let (pair_tx, pair_rx) = tokio::sync::mpsc::channel::<(String, String, PairInfo)>(4096);
 
     let mut app = JimmyTUI::new(
         chain_id,
         &address_display,
         &balance_bnb,
-        pairs_rx,
+        pair_tx,
+        pair_rx,
+        ws,
         provider,
         cli.clone(),
         new_store_with_defaults(),
@@ -172,7 +179,9 @@ pub struct JimmyTUI<P> {
     chain_id: u64,
     address: String,
     balance_bnb: String,
+    pair_tx: tokio::sync::mpsc::Sender<(String, String, PairInfo)>,
     pairs_rx: Option<tokio::sync::mpsc::Receiver<(String, String, PairInfo)>>,
+    ws: crate::libs::bsc::client::BscWsClient,
     provider: P,
     cli: crate::libs::bsc::client::BscClient,
     config_store: ConfigStore,
@@ -187,7 +196,9 @@ where
         chain_id: u64,
         address: &str,
         balance_bnb: &str,
+        pair_tx: tokio::sync::mpsc::Sender<(String, String, PairInfo)>,
         pairs_rx: tokio::sync::mpsc::Receiver<(String, String, PairInfo)>,
+        ws: crate::libs::bsc::client::BscWsClient,
         provider: P,
         cli: crate::libs::bsc::client::BscClient,
         config_store: ConfigStore,
@@ -196,7 +207,9 @@ where
             chain_id,
             address: address.to_string(),
             balance_bnb: balance_bnb.to_string(),
+            pair_tx,
             pairs_rx: Some(pairs_rx),
+            ws,
             provider,
             cli,
             config_store,
@@ -292,6 +305,7 @@ where
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
         let mut fee_ticker = tokio::time::interval(Duration::from_secs(15));
         let mut balance_ticker = tokio::time::interval(Duration::from_secs(5));
+        let mut dex_watch = tokio::time::interval(Duration::from_secs(1));
 
         // Hermes scroll
         let mut pairs_scroll: usize = 0;
@@ -303,14 +317,36 @@ where
         let mut results_scroll_state = ratatui::widgets::ScrollbarState::default();
         let mut results_areas: ResultsAreas = ResultsAreas::default();
 
+        // Logs state
+        let logs_dir = PathBuf::from("logs");
+        let mut logs_lines: Vec<String> = load_logs_from_dir(&logs_dir);
+        let mut logs_scroll: usize = 0;
+        let mut logs_scroll_state = ratatui::widgets::ScrollbarState::default();
+        let mut logs_refresh_ticker = tokio::time::interval(Duration::from_secs(1));
+
         // Average fee in USD (refreshed periodically)
         let mut avg_fee_usd: Option<String> = None;
         let mut config_areas: ConfigAreas = ConfigAreas::default();
 
-        let tab_labels: [&str; 4] = ["Home", "Auto Trade", "Results", "Settings"];
+        let tab_labels: [&str; 5] = ["Home", "Auto Trade", "Results", "Logs", "Settings"];
         let mut active_tab: usize = 0;
         let mut hovered_tab: Option<usize> = None;
         let mut tab_areas: Vec<Rect> = Vec::with_capacity(tab_labels.len());
+
+        // Hermes stream handles (per dex)
+        #[derive(Default)]
+        struct StreamHandles {
+            v2: Option<tokio::task::JoinHandle<()>>,
+            v3: Option<tokio::task::JoinHandle<()>>,
+            fm: Option<tokio::task::JoinHandle<()>>,
+            hb: Option<tokio::task::JoinHandle<()>>,
+        }
+        let mut stream_handles: StreamHandles = StreamHandles::default();
+        let mut last_dexes_csv = self
+            .config_store
+            .get("dexes")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "v2,v3,fm".to_string());
 
         // --- SETTINGS STATE ---
         let settings = load_settings_cache().unwrap_or_default();
@@ -361,9 +397,107 @@ where
         // Shared toggle for background sim usage
         let sim_mode_flag = Arc::new(AtomicBool::new(sim_mode));
 
+        let pairs_rx_local = self.pairs_rx.take().unwrap_or_else(|| {
+            let (_tx, rx) = tokio::sync::mpsc::channel::<(String, String, PairInfo)>(1);
+            rx
+        });
+
+        let dexes_enabled = |csv: &str| -> (bool, bool, bool) {
+            let lower = csv.to_ascii_lowercase();
+            (
+                lower.contains("v2"),
+                lower.contains("v3"),
+                lower.contains("fm"),
+            )
+        };
+
+        let sync_streams = |want_v2: bool,
+                            want_v3: bool,
+                            want_fm: bool,
+                            stream_handles: &mut StreamHandles,
+                            pair_tx: tokio::sync::mpsc::Sender<(String, String, PairInfo)>,
+                            ws: crate::libs::bsc::client::BscWsClient,
+                            provider: P| {
+            if want_v2 && stream_handles.v2.is_none() {
+                let tx = pair_tx.clone();
+                let ws_c = ws.clone();
+                let prov = provider.clone();
+                stream_handles.v2 = Some(tokio::spawn(async move {
+                    pancakev2_stream(tx, ws_c, prov).await;
+                }));
+            } else if !want_v2 {
+                if let Some(h) = stream_handles.v2.take() {
+                    h.abort();
+                }
+            }
+
+            if want_v3 && stream_handles.v3.is_none() {
+                let tx = pair_tx.clone();
+                let ws_c = ws.clone();
+                let prov = provider.clone();
+                stream_handles.v3 = Some(tokio::spawn(async move {
+                    pancakev3_stream(tx, ws_c, prov).await;
+                }));
+            } else if !want_v3 {
+                if let Some(h) = stream_handles.v3.take() {
+                    h.abort();
+                }
+            }
+
+            if want_fm && stream_handles.fm.is_none() {
+                let tx = pair_tx.clone();
+                let ws_c = ws.clone();
+                let prov = provider.clone();
+                stream_handles.fm = Some(tokio::spawn(async move {
+                    fourmeme_stream(tx, ws_c, prov).await;
+                }));
+            } else if !want_fm {
+                if let Some(h) = stream_handles.fm.take() {
+                    h.abort();
+                }
+            }
+        };
+
+        let initial_dexes = last_dexes_csv.clone();
+        let (want_v2, want_v3, want_fm) = dexes_enabled(&initial_dexes);
+        sync_streams(
+            want_v2,
+            want_v3,
+            want_fm,
+            &mut stream_handles,
+            self.pair_tx.clone(),
+            self.ws.clone(),
+            self.provider.clone(),
+        );
+        if stream_handles.hb.is_none() {
+            let tx_hb = self.pair_tx.clone();
+            stream_handles.hb = Some(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+                loop {
+                    ticker.tick().await;
+                    let line1 = "hb | Hermes heartbeat | Price: ?".to_string();
+                    let link = String::new();
+                    let pair_info = PairInfo {
+                        addr1: Address::ZERO,
+                        addr2: Address::ZERO,
+                        pair: Address::ZERO,
+                        fee: None,
+                        tick_spacing: None,
+                        symbol_base: "HB".to_string(),
+                        symbol_quote: "HB".to_string(),
+                        liquidity_usd: None,
+                        buy_count: 0,
+                        sell_count: 0,
+                        unique_buyers: 0,
+                    };
+                    let _ = tx_hb.try_send((line1, link, pair_info));
+                }
+            }));
+        }
+
         // Spawn background ingestion loop to drain pairs_rx continuously
-        if let Some(rx_taken) = self.pairs_rx.take() {
-            let mut rx_bg = rx_taken;
+        {
+            let mut rx_bg = pairs_rx_local;
             let pairs_map_c = pairs_map.clone();
             let pair_keys_c = pair_keys.clone();
             let sold_pairs_c = sold_pairs.clone();
@@ -374,6 +508,24 @@ where
             tokio::spawn(async move {
                 while let Some((l1, l2, pair_info)) = rx_bg.recv().await {
                     let pk = pair_key_addr(pair_info.pair);
+                    let dexes_csv = config_store_c
+                        .get("dexes")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "v2,v3,fm".to_string());
+                    let (en_v2, en_v3, en_fm) = {
+                        let lower = dexes_csv.to_ascii_lowercase();
+                        (lower.contains("v2"), lower.contains("v3"), lower.contains("fm"))
+                    };
+                    let src = crate::app::pair_state::detect_source(&l1);
+                    let allowed = match src {
+                        crate::app::pair_state::PairSource::V2 => en_v2,
+                        crate::app::pair_state::PairSource::V3 => en_v3,
+                        crate::app::pair_state::PairSource::FourMeme => en_fm,
+                        crate::app::pair_state::PairSource::Unknown => false,
+                    };
+                    if !allowed {
+                        continue;
+                    }
                     // 1) update Hermes state
                     {
                         let mut map = pairs_map_c.write().await;
@@ -510,6 +662,7 @@ where
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_add(1); }
                                 2 => { results_scroll = results_scroll.saturating_add(1); }
+                                3 => { logs_scroll = logs_scroll.saturating_add(1); }
                                 _ => {}
                             }
                         }
@@ -517,6 +670,7 @@ where
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_sub(1); }
                                 2 => { results_scroll = results_scroll.saturating_sub(1); }
+                                3 => { logs_scroll = logs_scroll.saturating_sub(1); }
                                 _ => {}
                             }
                         }
@@ -524,6 +678,7 @@ where
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_add(last_viewport_len.saturating_sub(1)); }
                                 2 => { results_scroll = results_scroll.saturating_add(10); }
+                                3 => { logs_scroll = logs_scroll.saturating_add(100); }
                                 _ => {}
                             }
                         }
@@ -531,6 +686,7 @@ where
                             match active_tab {
                                 0 => { pairs_scroll = pairs_scroll.saturating_sub(last_viewport_len.saturating_sub(1)); }
                                 2 => { results_scroll = results_scroll.saturating_sub(10); }
+                                3 => { logs_scroll = logs_scroll.saturating_sub(100); }
                                 _ => {}
                             }
                         }
@@ -538,6 +694,7 @@ where
                             match active_tab {
                                 0 => { pairs_scroll = 0; }
                                 2 => { results_scroll = 0; }
+                                3 => { logs_scroll = 0; }
                                 _ => {}
                             }
                         }
@@ -545,6 +702,7 @@ where
                             match active_tab {
                                 0 => { pairs_scroll = usize::MAX; }
                                 2 => { results_scroll = usize::MAX; }
+                                3 => { logs_scroll = usize::MAX; }
                                 _ => {}
                             }
                         }
@@ -599,8 +757,8 @@ where
                                     cfg_bindings(&config_areas, &self.config_store, &mut *se, mx, my, &mut focused_field, &mut input_buffer);
 
                                 }
-                                // Interactions INSIDE Settings view (tab index 3)
-                                if active_tab == 3 {
+                                // Interactions INSIDE Settings view (tab index 4)
+                                if active_tab == 4 {
                                     let contains = |r: Option<Rect>| -> bool {
                                         if let Some(rr) = r {
                                             mx >= rr.x && mx < rr.x + rr.width && my >= rr.y && my < rr.y + rr.height
@@ -637,6 +795,58 @@ where
                 // Refresh average BSC fee ($) using eth_gasPrice and WBNB->USDT spot via v2
                 let fee_str = self.cli.calculate_fee_str(&self.provider).await?;
                 avg_fee_usd = Some(fee_str);
+            }
+            _ = dex_watch.tick() => {
+                let now_csv = self
+                    .config_store
+                    .get("dexes")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "v2,v3,fm".to_string());
+                if now_csv != last_dexes_csv {
+                    let (want_v2, want_v3, want_fm) = dexes_enabled(&now_csv);
+                    sync_streams(
+                        want_v2,
+                        want_v3,
+                        want_fm,
+                        &mut stream_handles,
+                        self.pair_tx.clone(),
+                        self.ws.clone(),
+                        self.provider.clone(),
+                    );
+                    if !want_v2 || !want_v3 || !want_fm {
+                        let mut map = pairs_map.write().await;
+                        let mut keys = pair_keys.write().await;
+                        keys.retain(|k| {
+                            map.get(k).map(|v| {
+                                (want_v2 || v.source != crate::app::pair_state::PairSource::V2) &&
+                                (want_v3 || v.source != crate::app::pair_state::PairSource::V3) &&
+                                (want_fm || v.source != crate::app::pair_state::PairSource::FourMeme)
+                            }).unwrap_or(true)
+                        });
+                        map.retain(|_, v| {
+                            (want_v2 || v.source != crate::app::pair_state::PairSource::V2) &&
+                            (want_v3 || v.source != crate::app::pair_state::PairSource::V3) &&
+                            (want_fm || v.source != crate::app::pair_state::PairSource::FourMeme)
+                        });
+                    }
+                    last_dexes_csv = now_csv;
+                }
+            }
+            _ = logs_refresh_ticker.tick() => {
+                let dir = logs_dir.clone();
+                match tokio::task::spawn_blocking(move || load_logs_from_dir(&dir)).await {
+                    Ok(lines) => {
+                        logs_lines = lines;
+                        if logs_lines.is_empty() {
+                            logs_scroll = 0;
+                        } else if logs_scroll >= logs_lines.len() {
+                            logs_scroll = logs_lines.len().saturating_sub(1);
+                        }
+                    }
+                    Err(_) => {
+                        // keep previous lines on failure
+                    }
+                }
             }
             _ = balance_ticker.tick() => {
                 // Refresh on-chain balance for wallet panel + title
@@ -814,7 +1024,7 @@ where
                                             .title(Span::styled(title_text, Style::default().fg(Color::White)));
                                         f.render_widget(block, content_area);
                                         let inner = content_area.inner(ratatui::layout::Margin::new(2, 1));
-                                        results(
+                                    results(
                                             f,
                                             inner,
                                             &mut results_areas,
@@ -826,6 +1036,25 @@ where
                                             self.session_started_at.elapsed().as_secs(),
                                         );
 
+                                    }
+                                    3 => {
+                                        let total = logs_lines.len();
+                                        if total == 0 {
+                                            logs_scroll = 0;
+                                        } else {
+                                            logs_scroll = logs_scroll.min(total.saturating_sub(1));
+                                        }
+                                        let page = if total == 0 { 1 } else { (logs_scroll / 100) + 1 };
+                                        let pages = std::cmp::max(1, (total + 99) / 100);
+                                        let title = format!("Logs (newest first) {}/{} ({} lines)", page, pages, total);
+                                        draw_modal_lines(
+                                            f,
+                                            content_area,
+                                            title.as_str(),
+                                            &logs_lines,
+                                            logs_scroll,
+                                            &mut logs_scroll_state,
+                                        );
                                     }
                                     _ => {
                                         // Settings → toggles
@@ -897,6 +1126,51 @@ fn balance_short(bal: &str) -> String {
     } else {
         bal.to_string()
     }
+}
+
+fn load_logs_from_dir(dir: &PathBuf) -> Vec<String> {
+    let mut merged: Vec<(i64, i64, String)> = Vec::new();
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("log");
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        for (idx, line) in reader.lines().enumerate() {
+            if let Ok(l) = line {
+                let trimmed = l.trim_end();
+                let display = format!("{} | {}", file_name, trimmed);
+                merged.push((modified, idx as i64, display));
+            }
+        }
+    }
+
+    merged.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    merged.into_iter().map(|(_, _, s)| s).collect()
 }
 
 // triggers actual sells instead of simulation-only actions.

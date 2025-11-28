@@ -24,9 +24,7 @@ pub async fn wrap_bnb<P: Provider + Clone>(
     let wbnb = IWBNB::new(WBNB, provider.clone());
     let pending = wbnb.deposit().from(from).value(amount).send().await?;
     let tx = *pending.tx_hash();
-    tokio::spawn(async move {
-        let _ = pending.get_receipt().await;
-    });
+    let _ = pending.get_receipt().await;
     Ok(tx)
 }
 
@@ -39,8 +37,6 @@ pub async fn unwrap_wbnb<P: Provider + Clone>(
     let wbnb = IWBNB::new(WBNB, provider.clone());
     let pending = wbnb.withdraw(amount).from(from).send().await?;
     let tx = *pending.tx_hash();
-    tokio::spawn(async move {
-        let _ = pending.get_receipt().await;
-    });
+    let _ = pending.get_receipt().await;
     Ok(tx)
 }

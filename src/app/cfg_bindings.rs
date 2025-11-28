@@ -149,6 +149,13 @@ pub fn cfg_bindings(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "5".to_string());
     }
+    if contains(config_areas.wrap_ratio_input) {
+        *focused_field = Some("wrap_ratio_pct".to_string());
+        *input_buffer = config_store
+            .get("wrap_ratio_pct")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "80".to_string());
+    }
     if let Some(rects) = config_areas.accepted_quotes.as_ref() {
         for (i, r) in rects.iter().enumerate() {
             if contains(Some(*r)) {

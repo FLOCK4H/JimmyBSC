@@ -241,6 +241,7 @@ impl<P: Provider + Clone> PancakeV2<P> {
         log!(cc::YELLOW, "Minimum out: {} tokens", format_token(min_out, decs));
 
         self.approve_if_needed(WBNB, from, bnb_in_amount).await?;
+        log!(cc::YELLOW, "Approved WBNB for router {:?}", self.router_addr);
 
         let deadline = U256::from(
             SystemTime::now()
@@ -249,6 +250,7 @@ impl<P: Provider + Clone> PancakeV2<P> {
                 .as_secs()
                 + deadline_secs_from_now,
         );
+        log!(cc::YELLOW, "Deadline: {:?}", deadline);
 
         let router = IPancakeRouter02::new(self.router_addr, self.provider.clone());
         let path = vec![WBNB, token_out];
@@ -279,9 +281,16 @@ impl<P: Provider + Clone> PancakeV2<P> {
         if let Some(gas_price) = gas_price_override(gas_price_wei) {
             call = call.gas_price(gas_price);
         }
+        log!(cc::YELLOW, "Sending WBNB -> {} tx", token_out_str);
         let pending = call.send().await?;
         let tx = *pending.tx_hash();
-        let _ = pending.get_receipt().await;
+        log!(cc::YELLOW, "WBNB -> {} Tx: {:?}", token_out_str, tx);
+        let receipt = pending.get_receipt().await;
+        if let Ok(receipt) = receipt {
+            log!(cc::YELLOW, "Receipt: {:?}", receipt);
+        } else {
+            log!(cc::YELLOW, "Receipt error: {:?}", receipt);
+        }
         Ok((quoted, tx))
     }
 

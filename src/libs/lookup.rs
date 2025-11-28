@@ -76,7 +76,7 @@ pub fn search_known_tokens(query: &str) -> Vec<(String, Address)> {
 }
 
 pub fn save_log_to_file(log: &str) {
-    // Respect DEBUG_LOGS env; skip if not enabled
+    // skip if not enabled
     if !is_debug_logs_enabled() {
         return;
     }

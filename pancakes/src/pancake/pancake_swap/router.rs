@@ -313,9 +313,13 @@ impl<P: Provider + Clone> PancakeV3<P> {
         }
         let pending = call.send().await?;
         let tx = *pending.tx_hash();
-                tokio::spawn(async move {
-            let _ = pending.get_receipt().await;
-        });
+        log!(cc::YELLOW, "WBNB -> {} Tx: {:?}", token_out_str, tx);
+        let receipt = pending.get_receipt().await;
+        if let Ok(receipt) = receipt {
+            log!(cc::YELLOW, "Receipt: {:?}", receipt);
+        } else {
+            log!(cc::YELLOW, "Receipt error: {:?}", receipt);
+        }
         Ok((quoted, tx))
     }
 
@@ -354,6 +358,7 @@ impl<P: Provider + Clone> PancakeV3<P> {
         log!(cc::YELLOW, "Minimum out: {} tokens", format_token(min_out, out_decs));
 
         self.approve_if_needed(token_in, from, amount_in).await?;
+        log!(cc::YELLOW, "Approved {:?} for router", token_in);
 
         let deadline = U256::from(
             SystemTime::now()

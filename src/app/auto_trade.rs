@@ -21,7 +21,7 @@ use {
 };
 
 use crate::router::FmRouter;
-use crate::routy::{v2 as routy_v2, v3 as routy_v3};
+use crate::routy::{v2 as routy_v2, v3 as routy_v3, wbnb};
 use alloy::primitives::utils::parse_units;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, WalletProvider};
@@ -70,6 +70,41 @@ fn gas_price_wei_u128(config_store: &ConfigStore) -> u128 {
         .and_then(|wei| wei.try_into().ok())
         .filter(|wei| *wei > 0)
         .unwrap_or(DEFAULT_GAS_WEI)
+}
+
+fn wei_to_bnb(wei: U256) -> f64 {
+    wei.try_into()
+        .map(|v: u128| v as f64 / 1e18f64)
+        .unwrap_or(0.0)
+}
+
+fn wrap_ratio_pct_value(config_store: &ConfigStore) -> u64 {
+    config_store
+        .get("wrap_ratio_pct")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(1, 99))
+        .unwrap_or(80)
+}
+
+async fn wait_for_balance_drop<P>(
+    provider: P,
+    token: Address,
+    owner: Address,
+    bal_before: U256,
+    retries: usize,
+    delay_ms: u64,
+) -> Option<U256>
+where
+    P: Provider + Clone,
+{
+    for _ in 0..retries {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let bal_after = safe_balance_of(provider.clone(), token, owner).await;
+        if bal_after < bal_before {
+            return Some(bal_after);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -324,6 +359,73 @@ where
     }
 }
 
+async fn ensure_wbnb_topup<P>(
+    provider: P,
+    from: Address,
+    amount_needed: U256,
+    wrap_ratio_pct: u64,
+    pair_label: &str,
+) -> bool
+where
+    P: Provider + Clone + WalletProvider + Send + Sync + 'static,
+{
+    let wbnb_balance = safe_balance_of(provider.clone(), WBNB, from).await;
+    if wbnb_balance >= amount_needed {
+        return true;
+    }
+
+    let missing = amount_needed.saturating_sub(wbnb_balance);
+    let bnb_balance = provider.get_balance(from).await.unwrap_or(U256::ZERO);
+    let max_wrap = bnb_balance
+        .checked_mul(U256::from(wrap_ratio_pct))
+        .and_then(|v| v.checked_div(U256::from(100u64)))
+        .unwrap_or(U256::ZERO);
+    let wrap_amount = missing.min(max_wrap);
+
+    if wrap_amount.is_zero() {
+        save_log_to_file(&format!(
+            "[trade] SKIP {}: need {:.6} WBNB, have {:.6}, BNB {:.6} (wrap ratio {}%)",
+            pair_label,
+            wei_to_bnb(amount_needed),
+            wei_to_bnb(wbnb_balance),
+            wei_to_bnb(bnb_balance),
+            wrap_ratio_pct,
+        ));
+        return false;
+    }
+
+    match wbnb::wrap_bnb(provider.clone(), from, wrap_amount).await {
+        Ok(tx) => {
+            save_log_to_file(&format!(
+                "[trade] wrap {:.6} BNB -> WBNB for {} (ratio {}%) tx={:#x}",
+                wei_to_bnb(wrap_amount),
+                pair_label,
+                wrap_ratio_pct,
+                tx,
+            ));
+            let new_balance = safe_balance_of(provider.clone(), WBNB, from).await;
+            if new_balance < amount_needed {
+                save_log_to_file(&format!(
+                    "[trade] SKIP {}: after wrap WBNB {:.6} < needed {:.6}",
+                    pair_label,
+                    wei_to_bnb(new_balance),
+                    wei_to_bnb(amount_needed),
+                ));
+                return false;
+            }
+        }
+        Err(e) => {
+            save_log_to_file(&format!(
+                "[trade] SKIP {}: failed to wrap BNB: {}",
+                pair_label, e
+            ));
+            return false;
+        }
+    }
+
+    true
+}
+
 #[derive(Clone, Debug)]
 struct RealPosition {
     pair_address: String,
@@ -556,17 +658,26 @@ where
                 )
                     .await?;
             let bal_after = safe_balance_of(provider.clone(), plan.token_out, from).await;
-            if bal_after >= bal_before {
-                save_log_to_file(&format!(
-                    "[trade] ✗ V2 SELL {} ({}) tx={} but token balance did not decrease (before={} after={})",
-                    plan.base_symbol,
-                    plan.pair_key,
-                    tx,
-                    bal_before,
-                    bal_after
-                ));
-                return Err(anyhow!("sell tx mined but token balance did not decrease"));
-            }
+            let final_after = if bal_after < bal_before {
+                Some(bal_after)
+            } else {
+                wait_for_balance_drop(provider.clone(), plan.token_out, from, bal_before, 4, 400)
+                    .await
+            };
+            let _bal_after = match final_after {
+                Some(b) => b,
+                None => {
+                    save_log_to_file(&format!(
+                        "[trade] ✗ V2 SELL {} ({}) tx={} but token balance did not decrease (before={} after={})",
+                        plan.base_symbol,
+                        plan.pair_key,
+                        tx,
+                        bal_before,
+                        bal_after
+                    ));
+                    return Err(anyhow!("sell tx mined but token balance did not decrease"));
+                }
+            };
             save_log_to_file(&format!(
                 "[trade] ✓ V2 SELL {} ({}) @ {:+.2}% reason={} size:{:.6} BNB pct:{}",
                 plan.base_symbol,
@@ -599,17 +710,26 @@ where
                 )
                     .await?;
             let bal_after = safe_balance_of(provider.clone(), plan.token_out, from).await;
-            if bal_after >= bal_before {
-                save_log_to_file(&format!(
-                    "[trade] ✗ V3 SELL {} ({}) tx={} but token balance did not decrease (before={} after={})",
-                    plan.base_symbol,
-                    plan.pair_key,
-                    tx,
-                    bal_before,
-                    bal_after
-                ));
-                return Err(anyhow!("sell tx mined but token balance did not decrease"));
-            }
+            let final_after = if bal_after < bal_before {
+                Some(bal_after)
+            } else {
+                wait_for_balance_drop(provider.clone(), plan.token_out, from, bal_before, 4, 400)
+                    .await
+            };
+            let _bal_after = match final_after {
+                Some(b) => b,
+                None => {
+                    save_log_to_file(&format!(
+                        "[trade] ✗ V3 SELL {} ({}) tx={} but token balance did not decrease (before={} after={})",
+                        plan.base_symbol,
+                        plan.pair_key,
+                        tx,
+                        bal_before,
+                        bal_after
+                    ));
+                    return Err(anyhow!("sell tx mined but token balance did not decrease"));
+                }
+            };
             save_log_to_file(&format!(
                 "[trade] ✓ V3 SELL {} ({}) @ {:+.2}% reason={} size:{:.6} BNB pct:{}",
                 plan.base_symbol,
@@ -640,17 +760,26 @@ where
                 )
                 .await?;
             let bal_after = safe_balance_of(provider.clone(), plan.token_out, from).await;
-            if bal_after >= bal_before {
-                save_log_to_file(&format!(
-                    "[trade] ✗ FM SELL {} ({}) tx={:?} but token balance did not decrease (before={} after={})",
-                    plan.base_symbol,
-                    plan.pair_key,
-                    tx,
-                    bal_before,
-                    bal_after
-                ));
-                return Err(anyhow!("sell tx mined but token balance did not decrease"));
-            }
+            let final_after = if bal_after < bal_before {
+                Some(bal_after)
+            } else {
+                wait_for_balance_drop(provider.clone(), plan.token_out, from, bal_before, 6, 400)
+                    .await
+            };
+            let _bal_after = match final_after {
+                Some(b) => b,
+                None => {
+                    save_log_to_file(&format!(
+                        "[trade] ✗ FM SELL {} ({}) tx={:?} but token balance did not decrease (before={} after={})",
+                        plan.base_symbol,
+                        plan.pair_key,
+                        tx,
+                        bal_before,
+                        bal_after
+                    ));
+                    return Err(anyhow!("sell tx mined but token balance did not decrease"));
+                }
+            };
             save_log_to_file(&format!(
                 "[trade] ✓ FM SELL {} ({}) @ {:+.2}% reason={} size:{:.6} BNB pct:{}",
                 plan.base_symbol,
@@ -1192,6 +1321,7 @@ where
             None
         };
 
+        let wrap_ratio_pct = wrap_ratio_pct_value(config_store);
         let from = provider.default_signer_address();
         let gas_price_wei = gas_price_wei_u128(config_store);
         let gas_price_wei_override = U256::from(gas_price_wei);
@@ -1207,6 +1337,18 @@ where
                     None
                 };
                 if let Some(token_out) = token_out {
+                    if !ensure_wbnb_topup(
+                        provider.clone(),
+                        from,
+                        amount_wei,
+                        wrap_ratio_pct,
+                        &pair_info.symbol_base,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+
                     let bal_before = safe_balance_of(provider.clone(), token_out, from).await;
 
                     let dex_type = DexType::V2;
@@ -1282,6 +1424,18 @@ where
                     None
                 };
                 if let Some(token_out) = token_out {
+                    if !ensure_wbnb_topup(
+                        provider.clone(),
+                        from,
+                        amount_wei,
+                        wrap_ratio_pct,
+                        &pair_info.symbol_base,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+
                     let bal_before = safe_balance_of(provider.clone(), token_out, from).await;
 
                     let dex_type = DexType::V3;

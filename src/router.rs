@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-
+use crate::libs::lookup::save_log_to_file;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 
@@ -48,6 +48,7 @@ impl<P: Provider + Clone> FmRouter<P> {
         if funds_wei.is_zero() {
             bail!("funds_wei must be > 0");
         }
+        save_log_to_file(&format!("Buying with BNB AMAP: token={token:?}"));
         let helper = ITokenManagerHelper3::new(TOKEN_MANAGER_HELPER_3, self.provider.clone());
         let info = helper.getTokenInfo(token).call().await?;
         let token_manager = info.tokenManager;
@@ -59,6 +60,11 @@ impl<P: Provider + Clone> FmRouter<P> {
         let estimated_amount = try_ret.estimatedAmount;
         let min_amount = apply_negative_slippage(estimated_amount, slippage_bps);
         let to = recipient.unwrap_or(from);
+
+        save_log_to_file(&format!(
+            "Estimated amount for buy: {:?} (token={token:?})",
+            estimated_amount
+        ));
 
         if info.quote == Address::ZERO {
             let tm = ITokenManager2::new(token_manager, self.provider.clone());
@@ -106,6 +112,7 @@ impl<P: Provider + Clone> FmRouter<P> {
         if percent_bps == 0 || percent_bps > 10_000 {
             bail!("percent_bps must be 1..=10000");
         }
+        save_log_to_file(&format!("Selling percent: token={token:?}"));
         let helper = ITokenManagerHelper3::new(TOKEN_MANAGER_HELPER_3, self.provider.clone());
         let info = helper.getTokenInfo(token).call().await?;
         let token_manager = info.tokenManager;

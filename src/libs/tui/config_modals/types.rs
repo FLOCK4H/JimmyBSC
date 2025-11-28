@@ -23,6 +23,7 @@ pub struct ConfigAreas {
     pub max_hold_pnl_toggle: Option<Rect>,
     pub max_hold_input: Option<Rect>,
     pub accepted_quotes: Option<Vec<Rect>>,
+    pub wrap_ratio_input: Option<Rect>,
 }
 
 pub fn new_store_with_defaults() -> ConfigStore {
@@ -61,5 +62,6 @@ pub fn new_store_with_defaults() -> ConfigStore {
         "accepted_quotes".into(),
         "BNB,CAKE,USDT,USD1,ASTER,WBNB".into(),
     );
+    store.insert("wrap_ratio_pct".into(), "80".into());
     store
 }

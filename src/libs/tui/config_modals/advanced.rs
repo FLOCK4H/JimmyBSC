@@ -48,6 +48,7 @@ pub fn draw_advanced(
             Constraint::Length(1), // accepted quotes label
             Constraint::Length(1), // quotes row 1
             Constraint::Length(1), // quotes row 2
+            Constraint::Length(1), // wrap ratio
         ])
         .split(area);
 
@@ -191,5 +192,15 @@ pub fn draw_advanced(
 
     areas.accepted_quotes = Some(accepted_quotes_areas);
 
-    14 // Total rows used
+    draw_line(
+        f,
+        rows[14],
+        "Wrap ratio: ",
+        &kv(store, "wrap_ratio_pct", "80"),
+        "%",
+        focused_field == Some("wrap_ratio_pct"),
+    );
+    areas.wrap_ratio_input = Some(rows[14]);
+
+    15 // Total rows used
 }
