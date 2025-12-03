@@ -6,27 +6,12 @@
 
 # JimmyBSC
 
-TUI app for watching new BSC pairs and auto–trading them using simple rules.
+TUI app for watching new BSC pairs (four.meme / PancakeSwap) and auto–trading them using simple rules.
 
 > [!NOTE]
 > Provided software is **free**. One can distribute further under standard MIT license.
 
 **Tested for both Linux and Windows platforms.**
-
-It connects to:
-- PancakeSwap V2 & V3
-- [FourMeme](https://four.meme)
-
-to simulate or execute buys and sells based on streaming on–chain data. 
-
-You get:
-
-- A live “Hermes” feed of new pairs and prices
-- A configurable auto–trade engine (per–pair buy amount, TP/SL, max positions, max hold, etc.)
-- A results view with PnL and manual “Take / Partial / Remove” actions
-- A small settings panel to hide UI blocks and flip between simulation and real mode
-
-The whole thing runs in a single terminal window and logs to disk so you can replay sessions later.
 
 ### Home (Hermes feed)
 
